@@ -84,9 +84,11 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
 
 - (nullable id)addHandlersForProgress:(nullable SDWebImageDownloaderProgressBlock)progressBlock
                             completed:(nullable SDWebImageDownloaderCompletedBlock)completedBlock {
+    // 1.添加一个新的callback，同一个url可能有多个callback
     SDCallbacksDictionary *callbacks = [NSMutableDictionary new];
     if (progressBlock) callbacks[kProgressCallbackKey] = [progressBlock copy];
     if (completedBlock) callbacks[kCompletedCallbackKey] = [completedBlock copy];
+    // 2.保证同一个时刻只能有一个callback加入；新加入的callback，不影响队列其他任务执行
     dispatch_barrier_async(self.barrierQueue, ^{
         [self.callbackBlocks addObject:callbacks];
     });
@@ -95,6 +97,7 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
 
 - (nullable NSArray<id> *)callbacksForKey:(NSString *)key {
     __block NSMutableArray<id> *callbacks = nil;
+    // 保证同一时刻，只能有一个线程取callback；
     dispatch_sync(self.barrierQueue, ^{
         // We need to remove [NSNull null] because there might not always be a progress block for each callback
         callbacks = [[self.callbackBlocks valueForKey:key] mutableCopy];
@@ -105,6 +108,7 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
 
 - (BOOL)cancel:(nullable id)token {
     __block BOOL shouldCancel = NO;
+    // 保证同一时刻，只能有一个线程删除callback数组
     dispatch_barrier_sync(self.barrierQueue, ^{
         [self.callbackBlocks removeObjectIdenticalTo:token];
         if (self.callbackBlocks.count == 0) {
@@ -118,6 +122,8 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
 }
 
 - (void)start {
+    // 同一个时刻只能有一个线程，启动任务
+    // 如果当前任务已经取消，则结束任务；我觉得此处不太合理，取消的任务可否重新开始呢
     @synchronized (self) {
         if (self.isCancelled) {
             self.finished = YES;
@@ -126,11 +132,15 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
         }
 
 #if SD_UIKIT
+        // iOS 有这个类
         Class UIApplicationClass = NSClassFromString(@"UIApplication");
         BOOL hasApplication = UIApplicationClass && [UIApplicationClass respondsToSelector:@selector(sharedApplication)];
         if (hasApplication && [self shouldContinueWhenAppEntersBackground]) {
             __weak __typeof__ (self) wself = self;
             UIApplication * app = [UIApplicationClass performSelector:@selector(sharedApplication)];
+            // 开启后台任务；设置超时handler；
+            // handler中取消当前任务，如果不取消，应用会被系统杀死；
+            // 取消任务同时，结束后台任务：endBackgroundTask
             self.backgroundTaskId = [app beginBackgroundTaskWithExpirationHandler:^{
                 __strong __typeof (wself) sself = wself;
 
@@ -143,6 +153,7 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
             }];
         }
 #endif
+        // 初始化session
         NSURLSession *session = self.unownedSession;
         if (!self.unownedSession) {
             NSURLSessionConfiguration *sessionConfig = [NSURLSessionConfiguration defaultSessionConfiguration];
@@ -158,30 +169,34 @@ typedef NSMutableDictionary<NSString *, id> SDCallbacksDictionary;
                                                          delegateQueue:nil];
             session = self.ownedSession;
         }
-        
+        // 设置任务开始状态
         self.dataTask = [session dataTaskWithRequest:self.request];
         self.executing = YES;
     }
-    
+    // 开始任务
     [self.dataTask resume];
-
+    // 执行一次回调，执行回调时遍历；所有要执行的回调都要走一遍
     if (self.dataTask) {
         for (SDWebImageDownloaderProgressBlock progressBlock in [self callbacksForKey:kProgressCallbackKey]) {
             progressBlock(0, NSURLResponseUnknownLength, self.request.URL);
         }
         __weak typeof(self) weakSelf = self;
+        // 在主线程中，post通知
         dispatch_async(dispatch_get_main_queue(), ^{
             [[NSNotificationCenter defaultCenter] postNotificationName:SDWebImageDownloadStartNotification object:weakSelf];
         });
     } else {
+        // 如果没有初始化成功，就回调结束
         [self callCompletionBlocksWithError:[NSError errorWithDomain:NSURLErrorDomain code:0 userInfo:@{NSLocalizedDescriptionKey : @"Connection can't be initialized"}]];
     }
 
 #if SD_UIKIT
+    // 准备关闭任务
     Class UIApplicationClass = NSClassFromString(@"UIApplication");
     if(!UIApplicationClass || ![UIApplicationClass respondsToSelector:@selector(sharedApplication)]) {
         return;
     }
+    // ？？？，这个地方有些疑惑，为什么要再次关闭后台任务；前边已经设置了，这里是没必要的
     if (self.backgroundTaskId != UIBackgroundTaskInvalid) {
         UIApplication * app = [UIApplication performSelector:@selector(sharedApplication)];
         [app endBackgroundTask:self.backgroundTaskId];
